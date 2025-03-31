@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:dartz/dartz.dart';
 import 'package:injectable/injectable.dart';
 import 'package:rxdart/rxdart.dart';
@@ -276,8 +277,8 @@ class OfflineQueueServiceImpl implements OfflineQueueService {
           if (index != -1) {
             _operationQueue[index] = operation.incrementRetry();
           }
-        }
-      } catch (e) {
+        }}
+      } catch (e)  {
         // Error en el handler, incrementar reintentos
         final index = _operationQueue.indexOf(operation);
         if (index != -1 && operation.retryCount < 3) {
@@ -334,3 +335,23 @@ class OfflineQueueServiceImpl implements OfflineQueueService {
     return OfflineQueueServiceImpl(storageService, connectivityService);
   }
 }
+
+  @override
+  void dispose() {
+    // TODO: implement dispose
+  }
+
+  @override
+  List<PendingOperation> getOperations() {
+    // TODO: implement getOperations
+    throw UnimplementedError();
+  }
+
+  @override
+  // TODO: implement queueChanges
+  Stream<List<PendingOperation>> get queueChanges => throw UnimplementedError();
+
+  @override
+  void registerHandler<T>(String type, Future<Either<Failure, Unit>> Function(PendingOperation<T> p1) handler, {T Function(Map<String, dynamic> p1)? fromJson, Map<String, dynamic> Function(T p1)? toJson}) {
+    // TODO: implement registerHandler
+  }

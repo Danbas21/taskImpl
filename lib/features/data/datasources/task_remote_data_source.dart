@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:dartz/dartz.dart';
 import 'package:http/http.dart' as http;
 import 'package:injectable/injectable.dart';
@@ -9,30 +10,69 @@ import 'package:task_test/core/network/connectivity_service.dart';
 import 'package:task_test/core/network/offline_queue.dart';
 import 'package:task_test/features/data/models/task_model.dart';
 
-@injectable
-class TaskRemoteDataSourceImpl {
-  final http.Client client;
-  final String baseUrl;
-  final ConnectivityService connectivityService;
-  final OfflineQueueService offlineQueueService;
+abstract class TaskDataSource {
+  Future<Either<Failure, TaskModel>> getTaskById(String taskId);
+  Future<Either<Failure, List<TaskModel>>> getTasks();
+  Future<Either<Failure, Unit>> addTask(TaskModel task);
+  Future<Either<Failure, Unit>> updateTask(TaskModel task);
+  Future<Either<Failure, Unit>> deleteTask(String id);
+  Stream<Either<Failure, List<TaskModel>>> watchTask();
+  Future<Either<Failure, Unit>> cleanTask();
+}
+
+@Injectable(as: TaskDataSource)
+class TaskFirestoreDataSource implements TaskDataSource {
+
+  final FirebaseFirestore _firestore;
+  final ConnectivityService _connectivityService;
+  final OfflineQueueService _offlineQueueService;
   final BehaviorSubject<Either<Failure, List<TaskModel>>> _tasksSubject =
       BehaviorSubject<Either<Failure, List<TaskModel>>>();
   DateTime? _lastFetchTime;
   static const _cacheDuration = Duration(minutes: 5);
 
-  TaskRemoteDataSourceImpl({
-    required this.client,
-    @Named('apiBaseUrl') required this.baseUrl,
-    required this.connectivityService,
-    required this.offlineQueueService,
-  }) {
+  TaskFirestoreDataSource({
+    required FirebaseFirestore firestore,
+    required ConnectivityService connectivityService,
+    required OfflineQueueService offlineQueueService,
+  })  : _firestore = firestore,
+        _connectivityService = connectivityService,
+        _offlineQueueService = offlineQueueService {
     _registerOfflineHandlers();
+    // Suscribirse a cambios en Firestore para mantener el caché actualizado
+    _setupFirestoreListener();
+  }
+
+    // Referencia a la colección de tareas
+  CollectionReference<Map<String, dynamic>> get _tasksCollection =>
+      _firestore.collection('tasks');
+
+  void _setupFirestoreListener() {
+    // Esta suscripción mantendrá _tasksSubject actualizado automáticamente
+    _tasksCollection.snapshots().listen((snapshot) {
+      try {
+        final tasks = snapshot.docs.map((doc) {
+          final data = doc.data();
+          data['id'] = doc.id; // Asegurar que el ID esté incluido
+          return TaskModel.fromJson(data);
+        }).toList();
+        
+        _tasksSubject.add(Right(tasks));
+        _lastFetchTime = DateTime.now();
+      } catch (e) {
+        // No actualizar el subject en caso de error para mantener los datos anteriores
+        print('Error en Firestore listener: $e');
+      }
+    }, onError: (error) {
+      print('Error en Firestore listener: $error');
+      // No actualizamos el subject para mantener los últimos datos buenos
+    });
   }
 
   /// Registra los handlers para operaciones offline
   void _registerOfflineHandlers() {
     // Registrar handler para añadir tareas
-    offlineQueueService.registerHandler<TaskModel>(
+    _offlineQueueService.registerHandler<TaskModel>(
       'add_task',
       (operation) => _sendAddTaskToServer(operation.data!),
       fromJson: TaskModel.fromJson,
@@ -40,7 +80,7 @@ class TaskRemoteDataSourceImpl {
     );
 
     // Registrar handler para actualizar tareas
-    offlineQueueService.registerHandler<TaskModel>(
+    _offlineQueueService.registerHandler<TaskModel>(
       'update_task',
       (operation) => _sendUpdateTaskToServer(operation.data!),
       fromJson: TaskModel.fromJson,
@@ -48,12 +88,37 @@ class TaskRemoteDataSourceImpl {
     );
 
     // Registrar handler para eliminar tareas
-    offlineQueueService.registerHandler<String>(
+    _offlineQueueService.registerHandler<String>(
       'delete_task',
       (operation) => _sendDeleteTaskToServer(operation.resourceId!),
     );
   }
 
+  
+  Future<Either<Failure, TaskModel>> getTaskById(String taskId) async {
+  // Verificar conectividad
+  final isConnected = await _connectivityService.isConnected;
+  if (!isConnected) {
+    return Left(NetworkFailure('No hay conexión a Internet'));
+  }
+
+  try {
+  final docSnapshot = await _tasksCollection.doc(taskId).get();
+      
+     if (docSnapshot.exists) {
+        final data = docSnapshot.data()!;
+        data['id'] = docSnapshot.id;
+        final task = TaskModel.fromJson(data);
+        return Right(task);
+      } else {
+        return Left(NotFoundFailure());
+      }
+    } catch (e) {
+      return Left(NetworkFailure(e.toString()));
+    }
+  }
+  
+  /// Obtener todas las tareas
   Future<Either<Failure, List<TaskModel>>> getTasks() async {
     // Verificar caché con TTL
     if (_lastFetchTime != null &&
@@ -67,7 +132,7 @@ class TaskRemoteDataSourceImpl {
     }
 
     // Verificar conectividad
-    final isConnected = await connectivityService.isConnected;
+    final isConnected = await _connectivityService.isConnected;
     if (!isConnected) {
       // Si no hay conexión y hay caché (incluso con error), usar caché
       if (_tasksSubject.hasValue) {
@@ -77,57 +142,54 @@ class TaskRemoteDataSourceImpl {
     }
 
     try {
-      final response = await client.get(
-        Uri.parse('$baseUrl/tasks'),
-        headers: {'Accept-Encoding': 'gzip'}, // Solicitar compresión
-      );
+      final snapshot = await _tasksCollection.get();
+      final tasks = snapshot.docs.map((doc) {
+        final data = doc.data();
+        data['id'] = doc.id;
+        return TaskModel.fromJson(data);
+      }).toList();
 
-      if (response.statusCode == 200) {
-        final List<dynamic> tasksJson = json.decode(response.body);
-        final List<TaskModel> tasks =
-            tasksJson.map((json) => TaskModel.fromJson(json)).toList();
+      // Actualizar caché y timestamp
+      final result = Right<Failure, List<TaskModel>>(tasks);
+      _tasksSubject.add(result);
+      _lastFetchTime = DateTime.now();
 
-        // Actualizar caché y timestamp
-        final result = Right<Failure, List<TaskModel>>(tasks);
-        _tasksSubject.add(result);
-        _lastFetchTime = DateTime.now();
-
-        return result;
-      } else {
-        final failure = _handleErrorResponse(response);
-        _tasksSubject.add(Left(failure));
-        return Left(failure);
-      }
+      return result;
     } catch (e) {
       final failure = NetworkFailure(e.toString());
-      _tasksSubject.add(Left(failure));
       return Left(failure);
     }
   }
-
+  /// Agregar una tarea
   Future<Either<Failure, Unit>> addTask(TaskModel task) async {
+    // Crear una nueva tarea con ID temporal si es necesario
+    final taskToAdd = task.id.isEmpty
+        ? task.copyWith(id: _firestore.collection('tasks').doc().id)
+        : task;
+
     // Siempre hacer actualización optimista
-    await _updateTasksOptimistically((tasks) => [...tasks, task]);
+    await _updateTasksOptimistically((tasks) => [...tasks, taskToAdd]);
 
     // Verificar conectividad
-    final isConnected = await connectivityService.isConnected;
+    final isConnected = await _connectivityService.isConnected;
     if (!isConnected) {
       // Si no hay conexión, agregar a la cola offline
-      await offlineQueueService.addOperation(
+      await _offlineQueueService.addOperation(
         PendingOperation<TaskModel>(
           type: 'add_task',
-          data: task,
-          resourceId: task.id,
+          data: taskToAdd,
+          resourceId: taskToAdd.id,
         ),
       );
 
       return Right(unit);
     }
 
-    // Si hay conexión, enviar al servidor
-    return await _sendAddTaskToServer(task);
+    // Si hay conexión, enviar a Firestore
+    return await _sendAddTaskToServer(taskToAdd);
   }
 
+  
   Future<Either<Failure, Unit>> updateTask(TaskModel task) async {
     // Actualización optimista
     await _updateTasksOptimistically((tasks) {
@@ -135,10 +197,10 @@ class TaskRemoteDataSourceImpl {
     });
 
     // Verificar conectividad
-    final isConnected = await connectivityService.isConnected;
+    final isConnected = await _connectivityService.isConnected;
     if (!isConnected) {
       // Si no hay conexión, agregar a la cola offline
-      await offlineQueueService.addOperation(
+      await _offlineQueueService.addOperation(
         PendingOperation<TaskModel>(
           type: 'update_task',
           data: task,
@@ -149,53 +211,45 @@ class TaskRemoteDataSourceImpl {
       return Right(unit);
     }
 
-    // Si hay conexión, enviar al servidor
+    // Si hay conexión, enviar a Firestore
     return await _sendUpdateTaskToServer(task);
   }
 
-  Future<Either<Failure, Unit>> deleteTask(String id) async {
-    // Guardar estado actual para posible reversión
-    final currentState = _tasksSubject.value;
-
+ Future<Either<Failure, Unit>> deleteTask(String id) async {
     // Actualización optimista: eliminar la tarea localmente primero
     await _updateTasksOptimistically(
       (tasks) => tasks.where((task) => task.id != id).toList(),
     );
 
     // Verificar conectividad
-    final isConnected = await connectivityService.isConnected;
+    final isConnected = await _connectivityService.isConnected;
     if (!isConnected) {
       // Si no hay conexión, agregar a la cola offline
-      await offlineQueueService.addOperation(
+      await _offlineQueueService.addOperation(
         PendingOperation<String>(type: 'delete_task', resourceId: id),
       );
 
       return Right(unit);
     }
 
-    // Si hay conexión, enviar al servidor
+    // Si hay conexión, enviar a Firestore
     return await _sendDeleteTaskToServer(id);
   }
 
   // Métodos privados para enviar operaciones al servidor
 
-  Future<Either<Failure, Unit>> _sendAddTaskToServer(TaskModel task) async {
+   Future<Either<Failure, Unit>> _sendAddTaskToServer(TaskModel task) async {
     try {
-      final response = await client.post(
-        Uri.parse('$baseUrl/tasks'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode(task.toJson()),
-      );
-
-      if (response.statusCode == 201 || response.statusCode == 200) {
-        // Operación exitosa, actualizar stream
-        _updateTasksStream();
-        return Right(unit);
-      } else {
-        // Revertir cambio optimista y manejar error
-        _revertOptimisticUpdate();
-        return Left(_handleErrorResponse(response));
+      // Remover el id del objeto para que Firestore use el de la ruta
+      final taskData = task.toJson();
+      
+      // No enviamos el ID en los datos para evitar duplicación
+      if (taskData.containsKey('id')) {
+        taskData.remove('id');
       }
+      
+      await _tasksCollection.doc(task.id).set(taskData);
+      return Right(unit);
     } catch (e) {
       // Revertir cambio optimista y manejar error
       _revertOptimisticUpdate();
@@ -203,21 +257,17 @@ class TaskRemoteDataSourceImpl {
     }
   }
 
-  Future<Either<Failure, Unit>> _sendUpdateTaskToServer(TaskModel task) async {
-    try {
-      final response = await client.put(
-        Uri.parse('$baseUrl/tasks/${task.id}'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode(task.toJson()),
-      );
 
-      if (response.statusCode == 200) {
-        return Right(unit);
-      } else {
-        // Revertir actualización optimista
-        _revertOptimisticUpdate();
-        return Left(_handleErrorResponse(response));
+ Future<Either<Failure, Unit>> _sendUpdateTaskToServer(TaskModel task) async {
+    try {
+      // Remover el id del objeto para que Firestore use el de la ruta
+      final taskData = task.toJson();
+      if (taskData.containsKey('id')) {
+        taskData.remove('id');
       }
+      
+      await _tasksCollection.doc(task.id).update(taskData);
+      return Right(unit);
     } catch (e) {
       // Revertir actualización optimista
       _revertOptimisticUpdate();
@@ -225,17 +275,10 @@ class TaskRemoteDataSourceImpl {
     }
   }
 
-  Future<Either<Failure, Unit>> _sendDeleteTaskToServer(String id) async {
+    Future<Either<Failure, Unit>> _sendDeleteTaskToServer(String id) async {
     try {
-      final response = await client.delete(Uri.parse('$baseUrl/tasks/$id'));
-
-      if (response.statusCode == 200 || response.statusCode == 204) {
-        return Right(unit);
-      } else {
-        // Revertir al estado anterior
-        _revertOptimisticUpdate();
-        return Left(_handleErrorResponse(response));
-      }
+      await _tasksCollection.doc(id).delete();
+      return Right(unit);
     } catch (e) {
       // Revertir la actualización optimista
       _revertOptimisticUpdate();
@@ -322,7 +365,7 @@ class TaskRemoteDataSourceImpl {
         .debounceTime(const Duration(milliseconds: 100)); // Evitar sobrecarga
   }
 
-  Future<Either<Failure, Unit>> cleanTask() async {
+  Future<Either<Failure, Unit>>   cleanTask() async {
     try {
       _tasksSubject.add(Right<Failure, List<TaskModel>>([]));
       _lastFetchTime = null;
